@@ -313,6 +313,9 @@ final class Client
         while (!$response->readFinished()) {
             $next = $this->pollQuery($response->nextUri);
             $next->typedRows = array_merge($response->typedRows, $next->typedRows);
+            if ($next->schema === []) {
+                $next->schema = $response->schema;
+            }
             if ($next->finalUri === '') {
                 $next->finalUri = $response->finalUri;
             }

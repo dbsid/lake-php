@@ -58,7 +58,7 @@ Supported parameters:
 | `wait_time_secs` | Pagination: max wait per HTTP request |
 | `max_rows_in_buffer` | Pagination: server-side row buffer |
 | `max_rows_per_page` | Pagination: max rows per response page |
-| `location` / `timezone` | IANA timezone for `Timestamp` values (aliases) |
+| `location` / `timezone` | IANA session timezone (aliases): the server reads and returns `Timestamp` values, and evaluates `now()`, in it |
 | `sslmode` | `disable` for plain HTTP |
 | `login` | `disable` to skip `POST /v1/session/login` |
 | `empty_field_as` | Empty-CSV-field handling (stage upload, phase 2) |
@@ -188,7 +188,9 @@ $client = new Client(
 
 lake-php ships a `lake` database driver for **Laravel 9, 10, 11 and 12**:
 Eloquent models and the query builder read and write Lake without code
-changes. It needs PHP >= 8.1, also on Laravel 9.
+changes. It needs PHP >= 8.1, also on Laravel 9. The driver relies on
+version-specific Laravel internals, so Composer refuses to install lake-php
+next to other `illuminate/database` versions.
 
 ```bash
 composer require sdojjy/lake-php
@@ -207,10 +209,12 @@ auto-discovered. Add a connection in `config/database.php`:
         'username' => env('LAKE_USERNAME'),
         'password' => env('LAKE_PASSWORD'),
         'warehouse' => env('LAKE_WAREHOUSE'),
+        // Lake's session timezone: keep it equal to the app's (see "Dates" below).
+        'timezone' => config('app.timezone'),
         'prefix' => '',
         // Optional: any DSN parameter (tenant, role, access_token, timeout,
-        // timezone, sslmode, ...), extra session settings, and the sequences
-        // used for generated keys (see below).
+        // sslmode, ...), extra session settings, and the sequences used for
+        // generated keys (see below).
         // 'settings' => ['binary_output_format' => 'hex'],
         // 'sequences' => ['user_link_attribution_logs' => 'user_link_attribution_logs_id_seq'],
     ],
@@ -218,8 +222,9 @@ auto-discovered. Add a connection in `config/database.php`:
 ```
 
 Instead of the individual keys you can pass a full DSN as `'dsn' =>
-env('LAKE_DSN')`. Keep `'database'` set as well, because Laravel reads it. A
-`url` with a `lake://` scheme also works.
+env('LAKE_DSN')`; the other keys, `timezone` included, then belong in the DSN.
+Keep `'database'` set as well, because Laravel reads it. A `url` with a
+`lake://` scheme also works.
 
 To move an existing app over without touching its code, point the connection
 its models already use at the `lake` driver (or set `DB_CONNECTION=lake`).
@@ -242,13 +247,14 @@ with these Lake-specific differences:
 
 | Feature | Behavior on Lake |
 |---|---|
-| Generated keys | Lake has no `LAST_INSERT_ID()`. For `create()` / `save()` / `insertGetId()` on auto-incrementing models, a key you supply is used. Otherwise, if `sequences` maps the table to a Lake sequence (`CREATE SEQUENCE ...`), the driver takes `NEXTVAL()` and inserts with it. Otherwise it throws before writing. Alternatively set `$incrementing = false` on the model. |
+| Generated keys | Lake has no `LAST_INSERT_ID()`. For `create()` / `save()` / `insertGetId()` on auto-incrementing models, a key you supply is used. Otherwise, if `sequences` maps the table to a Lake sequence (`CREATE SEQUENCE ...`), the driver takes `NEXTVAL()` and inserts with it. Otherwise it throws `UnsupportedFeatureException` before writing. Alternatively set `$incrementing = false` on the model. |
 | `upsert()` | Compiled to `MERGE INTO`. Matched rows only get the given update columns (MySQL semantics). The return value is inserted + updated rows. |
-| Transactions | `BEGIN` / `COMMIT` / `ROLLBACK`. Lake has no savepoints, so a nested `transaction()` joins the outer one. |
+| Transactions | `BEGIN` / `COMMIT` / `ROLLBACK`. Lake has no savepoints, so a nested `transaction()` joins the outer one. If a nested transaction rolls back, Lake cannot undo only its part, so the whole transaction is rolled back instead: later statements in it fail, and committing the outer transaction rolls back and throws a `PDOException` (on MySQL, only the nested part would be undone). Likewise, a statement that fails inside a transaction aborts it on Lake, so committing it afterwards throws instead of silently rolling back. |
+| Eager loading with `limit()` (Laravel 11+) | Compiled with `row_number() over (partition by ...)`. |
 | `whereTime()` | Compiled to `date_format(col, '%H:%M:%S')`. Lake has no `TIME()`. |
-| Dates | Read back as `'Y-m-d'` / `'Y-m-d H:i:s[.u]'` strings like pdo_mysql, in the Lake session timezone (UTC unless configured otherwise). Wall-clock values written by Laravel round-trip unchanged. |
+| Dates | Read back as `'Y-m-d'` / `'Y-m-d H:i:s[.u]'` strings like pdo_mysql, in the Lake session timezone (the connection's `timezone`, UTC by default). Laravel writes wall-clock values in `app.timezone`. They round-trip unchanged either way, but SQL evaluated on the server (`DB::raw('now()')`, `today()`, `date_trunc(...)`, retention jobs) is off by the app's UTC offset unless `timezone` matches `app.timezone`. |
 | `cursor()` / `lazy()` | The result is buffered client-side, like pdo_mysql's default buffered mode. |
-| Not supported | Schema builder and migrations (manage Lake tables with SQL), `insertOrIgnore()`, `lockForUpdate()` / `sharedLock()`, MySQL JSON path queries (`col->key`). |
+| Not supported | Schema builder and migrations (manage Lake tables with SQL), `insertOrIgnore()`, `lockForUpdate()` / `sharedLock()`, MySQL JSON operations (`col->key`, `whereJsonContains()`, ...). These throw `TiDBCloud\Lake\Exception\UnsupportedFeatureException` before anything is sent. |
 
 Outside a Laravel app (`Illuminate\Database\Capsule\Manager`), register the
 driver yourself:
@@ -282,6 +288,11 @@ It supports `prepare` / `bindValue` / `bindParam` / `execute`, `query`,
 are interpolated client-side as SQL literals. Errors are thrown as
 `PDOException` with the original `LakeException` as `getPrevious()`.
 `lastInsertId()` is not supported.
+
+`inTransaction()` follows the transaction state the server reports, so
+`BEGIN` / `COMMIT` / `ROLLBACK` sent with `exec()` count too. After a statement
+fails inside a transaction (Lake then aborts the transaction), `commit()` rolls
+back and throws instead of reporting success.
 
 ## Protocol notes
 

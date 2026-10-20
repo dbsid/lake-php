@@ -140,6 +140,15 @@ final class Connection
     }
 
     /**
+     * Whether a transaction is open, as reported by the server; also
+     * reflects BEGIN/COMMIT/ROLLBACK sent as plain statements.
+     */
+    public function inTransaction(): bool
+    {
+        return $this->client->inTransaction();
+    }
+
+    /**
      * Executes a callback inside a transaction.
      *
      * @template T

@@ -297,8 +297,9 @@ final class ClientPaginationTest extends TestCase
                 'state' => 'Succeeded',
                 'next_uri' => '',
             ]),
-            $this->jsonResponse(['id' => 'q-begin', 'state' => 'Succeeded', 'next_uri' => '']),
-            $this->jsonResponse(['id' => 'q-commit', 'state' => 'Succeeded', 'next_uri' => '']),
+            $this->jsonResponse(['id' => 'q-begin', 'state' => 'Succeeded', 'next_uri' => '', 'session' => ['txn_state' => 'Active']]),
+            $this->jsonResponse(['id' => 'q-fail', 'state' => 'Failed', 'error' => ['code' => 1, 'message' => 'aborted'], 'session' => ['txn_state' => 'Fail']]),
+            $this->jsonResponse(['id' => 'q-commit', 'state' => 'Succeeded', 'next_uri' => '', 'session' => ['txn_state' => 'AutoCommit']]),
         ]);
 
         $config = Config::fromDsn('lake://u:p@localhost:8000/db?sslmode=disable&login=disable&warehouse=wh');
@@ -315,12 +316,35 @@ final class ClientPaginationTest extends TestCase
             'warehouse' => 'wh',
         ], $conn->info());
 
+        self::assertFalse($conn->inTransaction());
         $conn->begin();
+        self::assertTrue($conn->inTransaction());
+        try {
+            $conn->execute('SELECT 1');
+            self::fail('expected QueryException');
+        } catch (QueryException) {
+        }
+        // An aborted ("Fail") transaction is still open until it ends.
+        self::assertTrue($conn->inTransaction());
         $conn->commit();
+        self::assertFalse($conn->inTransaction());
 
         self::assertSame('/v1/verify', $http->requests[0]->getUri()->getPath());
         self::assertStringContainsString('"sql":"BEGIN"', $http->bodies[2]);
-        self::assertStringContainsString('"sql":"COMMIT"', $http->bodies[3]);
+        self::assertStringContainsString('"sql":"COMMIT"', $http->bodies[4]);
+    }
+
+    public function testTimezoneIsSentAsSessionSetting(): void
+    {
+        $http = new MockHttpClient([
+            $this->jsonResponse(['id' => 'q-1', 'state' => 'Succeeded', 'next_uri' => '']),
+        ]);
+
+        $config = Config::fromDsn('lake://u:p@localhost/db?sslmode=disable&login=disable&timezone=Asia/Shanghai');
+        (new Client($config, $http))->connect()->execute('SELECT 1');
+
+        $body = json_decode($http->bodies[0], true);
+        self::assertSame(['timezone' => 'Asia/Shanghai'], $body['session']['settings']);
     }
 
     public function testLoadFileWithPresignedStageUpload(): void

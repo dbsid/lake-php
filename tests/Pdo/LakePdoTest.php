@@ -185,6 +185,92 @@ final class LakePdoTest extends TestCase
         $pdo->commit();
     }
 
+    public function testTransactionStateFollowsTheServer(): void
+    {
+        $this->lake->ok();
+        $this->lake->ok();
+        $this->lake->ok();
+        $this->lake->ok();
+        $pdo = $this->lake->pdo();
+
+        // BEGIN / COMMIT sent as plain statements, e.g. DB::unprepared().
+        $pdo->exec('BEGIN');
+        self::assertTrue($pdo->inTransaction());
+        try {
+            $pdo->beginTransaction();
+            self::fail('expected PDOException');
+        } catch (\PDOException) {
+        }
+        $pdo->exec('COMMIT');
+        self::assertFalse($pdo->inTransaction());
+
+        self::assertTrue($pdo->beginTransaction());
+        self::assertTrue($pdo->commit());
+
+        self::assertSame(['BEGIN', 'COMMIT', 'BEGIN', 'COMMIT'], $this->lake->sqls());
+    }
+
+    public function testRollbackOnlyTransaction(): void
+    {
+        $this->lake->ok();
+        $this->lake->ok();
+        $pdo = $this->lake->pdo();
+
+        $pdo->beginTransaction();
+        $pdo->setRollbackOnly('Gone.');
+        try {
+            $pdo->prepare('insert into t values (1)')->execute();
+            self::fail('expected PDOException');
+        } catch (\PDOException $e) {
+            self::assertSame('25000', $e->errorInfo[0]);
+            self::assertSame('Gone. Roll the transaction back before running other statements.', $e->getMessage());
+        }
+        try {
+            $pdo->commit();
+            self::fail('expected PDOException');
+        } catch (\PDOException $e) {
+            self::assertSame('Gone. The transaction has been rolled back.', $e->getMessage());
+        }
+        self::assertFalse($pdo->inTransaction());
+
+        self::assertSame(['BEGIN', 'ROLLBACK'], $this->lake->sqls());
+    }
+
+    public function testFailedStatementMakesTheTransactionRollbackOnly(): void
+    {
+        $this->lake->ok();
+        $this->lake->error(1025, 'Unknown table');
+        $this->lake->ok();
+        $this->lake->ok();
+        $this->lake->ok();
+        $this->lake->error(1025, 'Unknown table');
+        $pdo = $this->lake->pdo();
+
+        $pdo->beginTransaction();
+        try {
+            $pdo->exec('select * from missing');
+            self::fail('expected PDOException');
+        } catch (\PDOException) {
+        }
+        // A plain ROLLBACK still ends it, and the next transaction is clean.
+        $pdo->exec('ROLLBACK');
+        self::assertFalse($pdo->inTransaction());
+        $pdo->exec('BEGIN');
+        $pdo->exec('COMMIT');
+
+        // Outside a transaction a failure has no lasting effect.
+        try {
+            $pdo->exec('select * from missing');
+            self::fail('expected PDOException');
+        } catch (\PDOException) {
+        }
+
+        self::assertSame(
+            ['BEGIN', 'select * from missing', 'ROLLBACK', 'BEGIN', 'COMMIT', 'select * from missing'],
+            $this->lake->sqls(),
+        );
+    }
+
     public function testQuoteAndServerVersion(): void
     {
         $this->lake->result(['version' => 'String'], [['v1.2.3']]);

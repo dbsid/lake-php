@@ -7,6 +7,9 @@ namespace TiDBCloud\Lake\Tests\Integration;
 use Carbon\Carbon;
 use Illuminate\Database\Capsule\Manager as Capsule;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Query\Builder as QueryBuilder;
+use Illuminate\Database\QueryException;
 use PHPUnit\Framework\TestCase;
 use TiDBCloud\Lake\Config;
 use TiDBCloud\Lake\Exception\LakeException;
@@ -21,8 +24,11 @@ use TiDBCloud\Lake\Laravel\LakeServiceProvider;
  */
 final class LaravelIntegrationTest extends TestCase
 {
+    private Capsule $capsule;
     private LakeConnection $db;
+    private string $dsn;
     private string $table;
+    private string $usersTable;
     private string $sequence;
 
     protected function setUp(): void
@@ -31,40 +37,49 @@ final class LaravelIntegrationTest extends TestCase
         if ($dsn === false || $dsn === '') {
             self::markTestSkipped('LAKE_DSN is not set');
         }
+        $this->dsn = $dsn;
 
         $suffix = bin2hex(random_bytes(4));
         $this->table = 'lake_php_it_logs_' . $suffix;
+        $this->usersTable = 'lake_php_it_users_' . $suffix;
         $this->sequence = 'lake_php_it_seq_' . $suffix;
 
-        $capsule = new Capsule();
-        LakeServiceProvider::registerDriver($capsule->getContainer());
-        $capsule->addConnection([
-            'driver' => 'lake',
-            'dsn' => $dsn,
-            // Laravel's ConnectionFactory always reads "database".
-            'database' => Config::fromDsn($dsn)->database,
-            'sequences' => [$this->table => $this->sequence],
-        ], 'lake');
-        $capsule->getDatabaseManager()->setDefaultConnection('lake');
-        $capsule->setAsGlobal();
-        $capsule->bootEloquent();
+        $this->capsule = new Capsule();
+        LakeServiceProvider::registerDriver($this->capsule->getContainer());
+        $this->addConnection('lake', $dsn);
+        $this->capsule->getDatabaseManager()->setDefaultConnection('lake');
+        $this->capsule->setAsGlobal();
+        $this->capsule->bootEloquent();
 
-        $this->db = $capsule->getConnection('lake');
+        $this->db = $this->capsule->getConnection('lake');
         $this->db->statement(
             "CREATE TABLE {$this->table} (id BIGINT, user_id BIGINT, link STRING NULL, flag BOOLEAN NULL,"
             . ' score DOUBLE NULL, created_at TIMESTAMP NULL, updated_at TIMESTAMP NULL)',
         );
         AttributionLog::$tableName = $this->table;
+        LinkOwner::$tableName = $this->usersTable;
     }
 
     protected function tearDown(): void
     {
         if (isset($this->db)) {
             $this->db->statement("DROP TABLE IF EXISTS {$this->table}");
+            $this->db->statement("DROP TABLE IF EXISTS {$this->usersTable}");
             $this->db->statement("DROP SEQUENCE IF EXISTS {$this->sequence}");
             $this->db->disconnect();
         }
         Carbon::setTestNow();
+    }
+
+    private function addConnection(string $name, string $dsn): void
+    {
+        $this->capsule->addConnection([
+            'driver' => 'lake',
+            'dsn' => $dsn,
+            // Laravel's ConnectionFactory always reads "database".
+            'database' => Config::fromDsn($dsn)->database,
+            'sequences' => [$this->table => $this->sequence],
+        ], $name);
     }
 
     public function testCustomerQuery(): void
@@ -191,6 +206,92 @@ final class LaravelIntegrationTest extends TestCase
         self::assertSame(0, $this->db->transactionLevel());
     }
 
+    public function testRollingBackANestedTransactionRollsBackTheOuterOne(): void
+    {
+        try {
+            $this->db->transaction(function (): void {
+                AttributionLog::create(['id' => 1, 'user_id' => 1]);
+                try {
+                    $this->db->transaction(function (): void {
+                        AttributionLog::create(['id' => 2, 'user_id' => 1]);
+                        throw new \DomainException('inner');
+                    });
+                } catch (\DomainException) {
+                }
+            });
+            self::fail('expected PDOException');
+        } catch (\PDOException $e) {
+            self::assertStringContainsString('A nested transaction was rolled back', $e->getMessage());
+        }
+
+        self::assertSame(0, AttributionLog::count());
+        self::assertSame(0, $this->db->transactionLevel());
+    }
+
+    public function testCommitFailsAfterAFailedStatement(): void
+    {
+        try {
+            // Lake aborts the transaction on the failed SELECT; without the
+            // driver's check, COMMIT would succeed and silently drop the row.
+            $this->db->transaction(function (): void {
+                AttributionLog::create(['id' => 1, 'user_id' => 1]);
+                try {
+                    $this->db->select('SELECT * FROM lake_php_it_no_such_table');
+                } catch (QueryException) {
+                }
+            });
+            self::fail('expected PDOException');
+        } catch (\PDOException $e) {
+            self::assertStringContainsString('A statement in this transaction failed', $e->getMessage());
+        }
+
+        self::assertSame(0, AttributionLog::count());
+    }
+
+    public function testEagerLoadWithLimit(): void
+    {
+        if (!method_exists(QueryBuilder::class, 'groupLimit')) {
+            self::markTestSkipped('Per-group limits need Laravel 11+.');
+        }
+        $this->db->statement("CREATE TABLE {$this->usersTable} (id BIGINT, name STRING NULL)");
+        $this->db->table($this->usersTable)->insert([['id' => 1, 'name' => 'a'], ['id' => 2, 'name' => 'b']]);
+        $this->db->table($this->table)->insert([
+            ['id' => 1, 'user_id' => 1],
+            ['id' => 2, 'user_id' => 1],
+            ['id' => 3, 'user_id' => 1],
+            ['id' => 4, 'user_id' => 2],
+            ['id' => 5, 'user_id' => 2],
+        ]);
+
+        $users = LinkOwner::with(['logs' => fn ($query) => $query->orderByDesc('id')->limit(2)])->orderBy('id')->get();
+
+        self::assertSame([[3, 2], [5, 4]], $users->map(fn (LinkOwner $user) => $user->logs->pluck('id')->all())->all());
+    }
+
+    public function testSessionTimezoneFollowsTheConnectionConfig(): void
+    {
+        $this->addConnection('lake_tz', $this->dsn . (str_contains($this->dsn, '?') ? '&' : '?') . 'timezone=Asia/Shanghai');
+        $db = $this->capsule->getConnection('lake_tz');
+        // The app timezone, in which Laravel writes wall-clock values.
+        $appTimezone = date_default_timezone_get();
+        date_default_timezone_set('Asia/Shanghai');
+
+        try {
+            $db->table($this->table)->insert(['id' => 1, 'user_id' => 1, 'created_at' => Carbon::parse('2026-01-02 03:04:05')]);
+
+            $row = $db->selectOne("SELECT created_at, to_unix_timestamp(created_at) AS epoch FROM {$this->table} WHERE id = 1");
+            self::assertSame('2026-01-02 03:04:05', $row->created_at);
+            self::assertSame(Carbon::parse('2026-01-02 03:04:05', 'Asia/Shanghai')->getTimestamp(), $row->epoch);
+
+            // Server-side now() reads in the same timezone as the app clock.
+            $serverNow = Carbon::parse($db->selectOne('SELECT now() AS n')->n);
+            self::assertLessThan(60, abs($serverNow->getTimestamp() - time()));
+        } finally {
+            date_default_timezone_set($appTimezone);
+            $db->disconnect();
+        }
+    }
+
     public function testUpsertUsesMerge(): void
     {
         $this->db->table($this->table)->insert([
@@ -274,5 +375,22 @@ class WithoutSequenceLog extends AttributionLog
     public function getTable()
     {
         return parent::getTable() . '_no_sequence';
+    }
+}
+
+class LinkOwner extends Model
+{
+    public static string $tableName = '';
+
+    protected $guarded = [];
+
+    public function getTable()
+    {
+        return static::$tableName;
+    }
+
+    public function logs(): HasMany
+    {
+        return $this->hasMany(AttributionLog::class, 'user_id');
     }
 }

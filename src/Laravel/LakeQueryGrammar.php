@@ -6,6 +6,7 @@ namespace TiDBCloud\Lake\Laravel;
 
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\Grammars\MySqlGrammar;
+use TiDBCloud\Lake\Exception\UnsupportedFeatureException;
 
 /**
  * Query grammar for TiDB Cloud Lake.
@@ -16,10 +17,22 @@ use Illuminate\Database\Query\Grammars\MySqlGrammar;
 class LakeQueryGrammar extends MySqlGrammar
 {
     /**
-     * Lake has no SAVEPOINT; a nested BEGIN is ignored by the server, so
-     * nested DB::transaction() calls simply join the outer transaction.
+     * Lake has no SAVEPOINT, so nested DB::transaction() calls join the
+     * outer transaction; see {@see LakeConnection::performRollBack()} for
+     * what rolling one back does.
      */
     public function supportsSavepoints()
+    {
+        return false;
+    }
+
+    /**
+     * Per-group limits (Laravel 11+, e.g. eager loading with limit()) always
+     * use row_number(), which Lake supports. MySQL's check would call
+     * isMaria(), which only MySqlConnection has, and would pick the MySQL
+     * 5.7 fallback built on user variables, which Lake lacks.
+     */
+    public function useLegacyGroupLimit(Builder $query)
     {
         return false;
     }
@@ -79,11 +92,29 @@ class LakeQueryGrammar extends MySqlGrammar
 
     public function compileInsertOrIgnore(Builder $query, array $values)
     {
-        throw new \RuntimeException('insertOrIgnore() is not supported by TiDB Cloud Lake.');
+        throw new UnsupportedFeatureException('insertOrIgnore() is not supported by TiDB Cloud Lake.');
     }
 
     public function compileInsertOrIgnoreUsing(Builder $query, array $columns, string $sql)
     {
-        throw new \RuntimeException('insertOrIgnoreUsing() is not supported by TiDB Cloud Lake.');
+        throw new UnsupportedFeatureException('insertOrIgnoreUsing() is not supported by TiDB Cloud Lake.');
+    }
+
+    protected function compileLock(Builder $query, $value)
+    {
+        throw new UnsupportedFeatureException('Row locks (lockForUpdate(), sharedLock(), lock()) are not supported by TiDB Cloud Lake.');
+    }
+
+    /**
+     * Every MySQL JSON operation (col->path selectors, whereJson*(), JSON
+     * updates) compiles through here, and Lake has none of the MySQL JSON
+     * functions they use.
+     */
+    protected function wrapJsonFieldAndPath($column)
+    {
+        throw new UnsupportedFeatureException(sprintf(
+            'MySQL JSON operations (on "%s") are not supported by TiDB Cloud Lake; use Lake\'s JSON functions in a raw expression instead.',
+            $column,
+        ));
     }
 }

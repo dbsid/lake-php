@@ -9,6 +9,7 @@ use TiDBCloud\Lake\Connection;
 use TiDBCloud\Lake\Exception\ApiException;
 use TiDBCloud\Lake\Exception\LakeException;
 use TiDBCloud\Lake\Exception\QueryException;
+use TiDBCloud\Lake\QueryResponse;
 use TiDBCloud\Lake\SqlEncoder;
 
 /**
@@ -37,7 +38,9 @@ final class LakePdo extends \PDO
         \PDO::ATTR_ORACLE_NULLS => \PDO::NULL_NATURAL,
     ];
 
-    private bool $inTransaction = false;
+    /** Why the open transaction can no longer commit, see {@see setRollbackOnly()}. */
+    private ?string $rollbackOnly = null;
+
     private ?string $serverVersion = null;
 
     /**
@@ -84,51 +87,102 @@ final class LakePdo extends \PDO
 
     public function exec(string $statement): int
     {
-        return self::wrap(fn (): int => $this->connection->execute($statement));
+        return $this->run($statement)->affectedRows();
+    }
+
+    /**
+     * Runs a statement to completion, rethrowing Lake errors as \PDOException.
+     *
+     * @internal used by {@see LakePdoStatement::execute()}
+     * @param array<int|string, mixed>|null $params
+     */
+    public function run(string $sql, ?array $params = null): QueryResponse
+    {
+        if (!$this->inTransaction()) {
+            // The transaction ended, e.g. through a plain ROLLBACK.
+            $this->rollbackOnly = null;
+        } elseif ($this->rollbackOnly !== null && preg_match('/^\s*ROLLBACK\b/i', $sql) !== 1) {
+            throw self::error('25000', $this->rollbackOnly . ' Roll the transaction back before running other statements.');
+        }
+
+        try {
+            return self::wrap(fn (): QueryResponse => $this->connection->run($sql, $params));
+        } catch (\PDOException $e) {
+            // Lake aborts a transaction when one of its statements fails, and
+            // a later COMMIT then silently rolls everything back.
+            if ($e->getPrevious() instanceof QueryException) {
+                $this->setRollbackOnly('A statement in this transaction failed, which aborts the transaction on TiDB Cloud Lake.');
+            }
+
+            throw $e;
+        }
     }
 
     public function beginTransaction(): bool
     {
-        if ($this->inTransaction) {
+        if ($this->inTransaction()) {
             throw self::error('HY000', 'There is already an active transaction');
         }
         self::wrap(fn () => $this->connection->begin());
-        $this->inTransaction = true;
+        $this->rollbackOnly = null;
 
         return true;
     }
 
+    /**
+     * Commits, unless the transaction was marked rollback-only: then it is
+     * rolled back and a \PDOException explains why.
+     */
     public function commit(): bool
     {
-        if (!$this->inTransaction) {
+        if (!$this->inTransaction()) {
             throw self::error('HY000', 'There is no active transaction');
         }
-        try {
-            self::wrap(fn () => $this->connection->commit());
-        } finally {
-            $this->inTransaction = false;
+        if ($this->rollbackOnly !== null) {
+            $reason = $this->rollbackOnly;
+            $this->rollBack();
+
+            throw self::error('25000', $reason . ' The transaction has been rolled back.');
         }
+        self::wrap(fn () => $this->connection->commit());
 
         return true;
     }
 
     public function rollBack(): bool
     {
-        if (!$this->inTransaction) {
+        if (!$this->inTransaction()) {
             throw self::error('HY000', 'There is no active transaction');
         }
         try {
             self::wrap(fn () => $this->connection->rollback());
         } finally {
-            $this->inTransaction = false;
+            $this->rollbackOnly = null;
         }
 
         return true;
     }
 
+    /**
+     * Follows the server's transaction state (like pdo_mysql), so BEGIN /
+     * COMMIT / ROLLBACK sent as plain statements are taken into account.
+     */
     public function inTransaction(): bool
     {
-        return $this->inTransaction;
+        return $this->connection->inTransaction();
+    }
+
+    /**
+     * Marks the open transaction as unable to commit: other statements are
+     * rejected, commit() rolls back and throws, rollBack() works as usual.
+     * For when part of a transaction must be undone but Lake has no
+     * savepoints to undo only that part.
+     */
+    public function setRollbackOnly(string $reason): void
+    {
+        if ($this->inTransaction()) {
+            $this->rollbackOnly ??= $reason;
+        }
     }
 
     /**

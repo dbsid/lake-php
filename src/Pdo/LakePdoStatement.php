@@ -103,8 +103,7 @@ final class LakePdoStatement extends \PDOStatement
             $values[$key] = self::coerce($reference[0], $reference[1]);
         }
 
-        $response = LakePdo::wrap(fn (): QueryResponse => $this->pdo->connection()->run($this->sql, self::sqlParams($values)));
-        $this->load($response);
+        $this->load($this->pdo->run($this->sql, self::sqlParams($values)));
 
         return true;
     }

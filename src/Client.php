@@ -122,6 +122,16 @@ final class Client
     }
 
     /**
+     * Whether the session has an open explicit transaction, as last
+     * reported by the server (session.txn_state). A transaction aborted by a
+     * failed statement ("Fail") stays open until COMMIT or ROLLBACK.
+     */
+    public function inTransaction(): bool
+    {
+        return in_array($this->sessionValue('txn_state'), ['Active', 'Fail'], true);
+    }
+
+    /**
      * POST /v1/session/login. Saves the X-DATABEND-SESSION-ID response
      * header and marks the session as logged in.
      */

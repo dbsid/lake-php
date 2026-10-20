@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace TiDBCloud\Lake\Tests\Support;
 
 use GuzzleHttp\Psr7\Response;
+use Psr\Http\Message\RequestInterface;
 use TiDBCloud\Lake\Client;
 use TiDBCloud\Lake\Config;
 use TiDBCloud\Lake\Connection;
@@ -95,10 +96,23 @@ final class FakeLake
         return $sqls;
     }
 
+    /**
+     * Like the server, the echoed session carries the transaction state:
+     * "Active" after a successful BEGIN, "AutoCommit" after COMMIT/ROLLBACK.
+     */
     private function push(array $body): void
     {
-        $this->http->push(new Response(200, ['Content-Type' => 'application/json'], json_encode(
-            $body + ['state' => 'Succeeded', 'session' => ['database' => 'db']],
-        )));
+        $this->http->push(static function (RequestInterface $request, string $sent) use ($body): Response {
+            $sent = json_decode($sent, true);
+            $txnState = $sent['session']['txn_state'] ?? 'AutoCommit';
+            $succeeded = ($body['state'] ?? 'Succeeded') === 'Succeeded';
+            if ($succeeded && preg_match('/^\s*(BEGIN|COMMIT|ROLLBACK)\b/i', (string) ($sent['sql'] ?? ''), $m) === 1) {
+                $txnState = strtoupper($m[1]) === 'BEGIN' ? 'Active' : 'AutoCommit';
+            }
+
+            return new Response(200, ['Content-Type' => 'application/json'], json_encode(
+                $body + ['state' => 'Succeeded', 'session' => ['database' => 'db', 'txn_state' => $txnState]],
+            ));
+        });
     }
 }

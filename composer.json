@@ -26,6 +26,9 @@
         "illuminate/pagination": "^9.52 || ^10.0 || ^11.0 || ^12.0",
         "phpunit/phpunit": "^10.5"
     },
+    "conflict": {
+        "illuminate/database": "<9.52 || >=13.0"
+    },
     "suggest": {
         "ext-pdo": "Required for the PDO adapter (TiDBCloud\\Lake\\Pdo) and the Laravel driver",
         "illuminate/database": "Required to use the Laravel / Eloquent \"lake\" database driver (Laravel 9-12)"

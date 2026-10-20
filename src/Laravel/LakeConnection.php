@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace TiDBCloud\Lake\Laravel;
 
 use Illuminate\Database\Connection;
+use TiDBCloud\Lake\Exception\UnsupportedFeatureException;
 use TiDBCloud\Lake\Pdo\LakePdo;
 
 /**
@@ -38,7 +39,7 @@ class LakeConnection extends Connection
      */
     public function getSchemaBuilder()
     {
-        throw new \LogicException(
+        throw new UnsupportedFeatureException(
             'The lake database driver does not support the schema builder; manage Lake tables with SQL statements.',
         );
     }
@@ -70,6 +71,31 @@ class LakeConnection extends Connection
         }
 
         parent::disconnect();
+    }
+
+    /**
+     * Lake has no savepoints, so rolling back a nested transaction cannot
+     * undo just its own statements. Rather than keeping them (Laravel's
+     * behavior without savepoints, which would let the outer commit persist
+     * them), the whole transaction becomes rollback-only: later statements
+     * fail, and committing the outer transaction rolls everything back and
+     * throws. Rolling back the outer transaction works as usual.
+     */
+    protected function performRollBack($toLevel)
+    {
+        if ($toLevel > 0) {
+            $pdo = $this->getPdo();
+            if ($pdo instanceof LakePdo) {
+                $pdo->setRollbackOnly(
+                    'A nested transaction was rolled back, and TiDB Cloud Lake has no savepoints to undo only its part, '
+                    . 'so the outer transaction cannot commit.',
+                );
+            }
+
+            return;
+        }
+
+        parent::performRollBack($toLevel);
     }
 
     protected function getDefaultQueryGrammar()

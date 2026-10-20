@@ -7,11 +7,13 @@ namespace TiDBCloud\Lake\Tests\Laravel;
 use Carbon\Carbon;
 use Illuminate\Database\ConnectionResolver;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Query\Builder;
 use PHPUnit\Framework\TestCase;
-use TiDBCloud\Lake\Exception\LakeException;
+use TiDBCloud\Lake\Exception\UnsupportedFeatureException;
 use TiDBCloud\Lake\Laravel\LakeConnection;
 use TiDBCloud\Lake\Laravel\LakeQueryBuilder;
 use TiDBCloud\Lake\Laravel\LakeQueryGrammar;
+use TiDBCloud\Lake\Tests\Laravel\Fixtures\LinkUser;
 use TiDBCloud\Lake\Tests\Laravel\Fixtures\UserLinkAttributionLog;
 use TiDBCloud\Lake\Tests\Support\FakeLake;
 
@@ -171,12 +173,25 @@ final class LakeConnectionTest extends TestCase
         ], $this->lake->sqls());
     }
 
+    public function testInsertGetIdReturnsTheKeyLosslessly(): void
+    {
+        for ($i = 0; $i < 4; $i++) {
+            $this->lake->dml(['number of rows inserted' => 1]);
+        }
+
+        $table = fn () => $this->connection->table('t');
+        self::assertSame(42, $table()->insertGetId(['id' => '42']));
+        self::assertSame('007', $table()->insertGetId(['id' => '007']));
+        self::assertSame('1e3', $table()->insertGetId(['id' => '1e3']));
+        self::assertSame('18446744073709551615', $table()->insertGetId(['id' => '18446744073709551615']));
+    }
+
     public function testInsertGetIdWithoutKeyOrSequenceWritesNothing(): void
     {
         try {
             UserLinkAttributionLog::create(['user_id' => 42]);
-            self::fail('expected LakeException');
-        } catch (LakeException $e) {
+            self::fail('expected UnsupportedFeatureException');
+        } catch (UnsupportedFeatureException $e) {
             self::assertStringContainsString('user_link_attribution_logs', $e->getMessage());
             self::assertStringContainsString('sequences', $e->getMessage());
         }
@@ -234,10 +249,49 @@ final class LakeConnectionTest extends TestCase
         );
     }
 
-    public function testInsertOrIgnoreIsRejected(): void
+    public function testEagerLoadWithLimitUsesRowNumber(): void
     {
-        $this->expectException(\RuntimeException::class);
-        $this->connection->table('t')->insertOrIgnore(['id' => 1]);
+        if (!method_exists(Builder::class, 'groupLimit')) {
+            self::markTestSkipped('Per-group limits need Laravel 11+.');
+        }
+        $this->lake->result(['id' => 'Int64'], [['42'], ['43']]);
+        $this->lake->result(['id' => 'Int64', 'user_id' => 'Int64', 'laravel_row' => 'UInt64'], [['1', '42', '1'], ['3', '43', '1']]);
+
+        $users = LinkUser::with(['logs' => fn ($query) => $query->orderBy('id')->limit(1)])->get();
+
+        self::assertSame([
+            'select * from `users`',
+            'select * from (select *, row_number() over (partition by `user_link_attribution_logs`.`user_id` order by `id` asc) as `laravel_row`'
+            . ' from `user_link_attribution_logs` where `user_link_attribution_logs`.`user_id` in (42, 43))'
+            . ' as `laravel_table` where `laravel_row` <= 1 order by `laravel_row`',
+        ], $this->lake->sqls());
+        self::assertSame([1], $users[0]->logs->pluck('id')->all());
+        self::assertSame([3], $users[1]->logs->pluck('id')->all());
+    }
+
+    public function testUnsupportedFeaturesFailBeforeSending(): void
+    {
+        $table = fn () => $this->connection->table('t');
+        $attempts = [
+            'insertOrIgnore' => fn () => $table()->insertOrIgnore(['id' => 1]),
+            'lockForUpdate' => fn () => $table()->lockForUpdate()->get(),
+            'sharedLock' => fn () => $table()->sharedLock()->get(),
+            'JSON where' => fn () => $table()->where('meta->a', 1)->get(),
+            'JSON select' => fn () => $table()->select('meta->a')->get(),
+            'whereJsonContains' => fn () => $table()->whereJsonContains('tags', 'x')->get(),
+            'whereJsonLength' => fn () => $table()->whereJsonLength('tags', 2)->get(),
+            'JSON update' => fn () => $table()->update(['meta->a' => 1]),
+        ];
+
+        foreach ($attempts as $feature => $attempt) {
+            try {
+                $attempt();
+                self::fail('expected UnsupportedFeatureException for ' . $feature);
+            } catch (UnsupportedFeatureException) {
+            }
+        }
+
+        self::assertSame([], $this->lake->http->requests);
     }
 
     public function testNestedTransactionsUseNoSavepoints(): void
@@ -253,6 +307,89 @@ final class LakeConnectionTest extends TestCase
         });
 
         self::assertSame(['BEGIN', 'insert into t values (1)', 'COMMIT'], $this->lake->sqls());
+    }
+
+    public function testRollingBackANestedTransactionRollsBackTheOuterOne(): void
+    {
+        $this->lake->ok();
+        $this->lake->dml(['number of rows inserted' => 1]);
+        $this->lake->dml(['number of rows inserted' => 1]);
+        $this->lake->ok();
+
+        try {
+            $this->connection->transaction(function (LakeConnection $connection): void {
+                $connection->insert('insert into t values (?)', ['a']);
+                try {
+                    $connection->transaction(function (LakeConnection $connection): void {
+                        $connection->insert('insert into t values (?)', ['b']);
+                        throw new \DomainException('inner');
+                    });
+                } catch (\DomainException) {
+                }
+            });
+            self::fail('expected PDOException');
+        } catch (\PDOException $e) {
+            self::assertStringContainsString('A nested transaction was rolled back', $e->getMessage());
+            self::assertStringContainsString('The transaction has been rolled back.', $e->getMessage());
+        }
+
+        // On MySQL only 'b' would be undone; Lake cannot, so nothing commits.
+        self::assertSame(['BEGIN', "insert into t values ('a')", "insert into t values ('b')", 'ROLLBACK'], $this->lake->sqls());
+        self::assertSame(0, $this->connection->transactionLevel());
+        self::assertFalse($this->connection->getPdo()->inTransaction());
+    }
+
+    public function testStatementsAfterANestedRollbackAreRejected(): void
+    {
+        $this->lake->ok();
+        $this->lake->ok();
+        $this->lake->ok();
+        $this->lake->dml(['number of rows inserted' => 1]);
+        $this->lake->ok();
+
+        $this->connection->beginTransaction();
+        $this->connection->beginTransaction();
+        $this->connection->rollBack();
+
+        try {
+            $this->connection->insert('insert into t values (1)');
+            self::fail('expected QueryException');
+        } catch (\Illuminate\Database\QueryException $e) {
+            self::assertStringContainsString('Roll the transaction back before running other statements.', $e->getMessage());
+        }
+
+        $this->connection->rollBack();
+        self::assertSame(0, $this->connection->transactionLevel());
+
+        // The next transaction starts clean.
+        $this->connection->transaction(fn (LakeConnection $connection) => $connection->insert('insert into t values (2)'));
+
+        self::assertSame(['BEGIN', 'ROLLBACK', 'BEGIN', 'insert into t values (2)', 'COMMIT'], $this->lake->sqls());
+    }
+
+    public function testCommitFailsAfterAFailedStatement(): void
+    {
+        $this->lake->ok();
+        $this->lake->dml(['number of rows inserted' => 1]);
+        $this->lake->error(1025, 'Unknown table');
+        $this->lake->ok();
+
+        try {
+            // A tolerated failure: on Lake it aborts the transaction, and
+            // COMMIT would otherwise silently roll back the insert.
+            $this->connection->transaction(function (LakeConnection $connection): void {
+                $connection->insert('insert into t values (1)');
+                try {
+                    $connection->select('select * from missing');
+                } catch (\Illuminate\Database\QueryException) {
+                }
+            });
+            self::fail('expected PDOException');
+        } catch (\PDOException $e) {
+            self::assertStringContainsString('A statement in this transaction failed', $e->getMessage());
+        }
+
+        self::assertSame(['BEGIN', 'insert into t values (1)', 'select * from missing', 'ROLLBACK'], $this->lake->sqls());
     }
 
     public function testTransactionRollsBackOnException(): void
@@ -288,7 +425,7 @@ final class LakeConnectionTest extends TestCase
 
     public function testSchemaBuilderIsNotSupported(): void
     {
-        $this->expectException(\LogicException::class);
+        $this->expectException(UnsupportedFeatureException::class);
         $this->connection->getSchemaBuilder();
     }
 }

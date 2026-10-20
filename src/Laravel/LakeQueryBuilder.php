@@ -6,7 +6,7 @@ namespace TiDBCloud\Lake\Laravel;
 
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\Expression;
-use TiDBCloud\Lake\Exception\LakeException;
+use TiDBCloud\Lake\Exception\UnsupportedFeatureException;
 
 /**
  * Query builder for TiDB Cloud Lake.
@@ -34,7 +34,7 @@ class LakeQueryBuilder extends Builder
             $table = (string) $this->from;
             $lakeSequence = ($this->connection->getConfig('sequences') ?? [])[$table] ?? null;
             if (!is_string($lakeSequence) || $lakeSequence === '') {
-                throw new LakeException(sprintf(
+                throw new UnsupportedFeatureException(sprintf(
                     'TiDB Cloud Lake cannot return generated keys: insert into "%s" needs a "%s" value. '
                     . 'Provide the key, map the table to a Lake sequence in the connection\'s "sequences" config, '
                     . 'or set $incrementing = false on the model.',
@@ -44,13 +44,16 @@ class LakeQueryBuilder extends Builder
             }
             $values[$key] = $this->connection->nextSequenceValue($lakeSequence);
         } elseif ($values[$key] instanceof Expression) {
-            throw new LakeException(sprintf('insertGetId() cannot return the key "%s" when it is a raw expression.', $key));
+            throw new UnsupportedFeatureException(sprintf('insertGetId() cannot return the key "%s" when it is a raw expression.', $key));
         }
 
         $this->insert($values);
 
         $id = $values[$key];
 
-        return is_numeric($id) ? (int) $id : $id;
+        // Like MySQL, a numeric key comes back as an int, but only when that
+        // is lossless: '42' does, '042', '1e3' and values beyond PHP_INT_MAX
+        // are returned as given.
+        return is_string($id) && (string) (int) $id === $id ? (int) $id : $id;
     }
 }

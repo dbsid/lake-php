@@ -73,9 +73,17 @@ final class FakeLake
         $this->push([]);
     }
 
-    public function error(int $code, string $message): void
+    /**
+     * Queues a failed query. $txnState overrides the transaction state the
+     * response reports, e.g. "Fail" as the server does for execution errors.
+     */
+    public function error(int $code, string $message, ?string $txnState = null): void
     {
-        $this->push(['state' => 'Failed', 'error' => ['code' => $code, 'message' => $message]]);
+        $body = ['state' => 'Failed', 'error' => ['code' => $code, 'message' => $message]];
+        if ($txnState !== null) {
+            $body['session'] = ['database' => 'db', 'txn_state' => $txnState];
+        }
+        $this->push($body);
     }
 
     /**

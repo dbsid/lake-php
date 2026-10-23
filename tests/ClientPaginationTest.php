@@ -319,6 +319,7 @@ final class ClientPaginationTest extends TestCase
         self::assertFalse($conn->inTransaction());
         $conn->begin();
         self::assertTrue($conn->inTransaction());
+        self::assertSame('Active', $conn->transactionState());
         try {
             $conn->execute('SELECT 1');
             self::fail('expected QueryException');
@@ -326,8 +327,10 @@ final class ClientPaginationTest extends TestCase
         }
         // An aborted ("Fail") transaction is still open until it ends.
         self::assertTrue($conn->inTransaction());
+        self::assertSame('Fail', $conn->transactionState());
         $conn->commit();
         self::assertFalse($conn->inTransaction());
+        self::assertSame('AutoCommit', $conn->transactionState());
 
         self::assertSame('/v1/verify', $http->requests[0]->getUri()->getPath());
         self::assertStringContainsString('"sql":"BEGIN"', $http->bodies[2]);

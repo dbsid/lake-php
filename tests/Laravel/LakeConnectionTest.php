@@ -6,6 +6,7 @@ namespace TiDBCloud\Lake\Tests\Laravel;
 
 use Carbon\Carbon;
 use Illuminate\Database\ConnectionResolver;
+use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder;
 use PHPUnit\Framework\TestCase;
@@ -337,6 +338,46 @@ final class LakeConnectionTest extends TestCase
         self::assertSame(['BEGIN', "insert into t values ('a')", "insert into t values ('b')", 'ROLLBACK'], $this->lake->sqls());
         self::assertSame(0, $this->connection->transactionLevel());
         self::assertFalse($this->connection->getPdo()->inTransaction());
+    }
+
+    public function testFailedCommitDropsItsAfterCommitCallbacks(): void
+    {
+        $this->connection->setTransactionManager(new DatabaseTransactionsManager());
+        $this->lake->ok();
+        $this->lake->ok();
+        $this->lake->ok();
+        $this->lake->ok();
+
+        $calls = [];
+        try {
+            $this->connection->transaction(function (LakeConnection $connection) use (&$calls): void {
+                $connection->afterCommit(function () use (&$calls): void {
+                    $calls[] = 'afterCommit of the rolled-back transaction';
+                });
+                if (method_exists($connection, 'afterRollBack')) {
+                    $connection->afterRollBack(function () use (&$calls): void {
+                        $calls[] = 'afterRollBack';
+                    });
+                }
+                try {
+                    $connection->transaction(fn () => throw new \DomainException('inner'));
+                } catch (\DomainException) {
+                }
+            });
+            self::fail('expected PDOException');
+        } catch (\PDOException) {
+        }
+
+        $this->connection->transaction(function (LakeConnection $connection) use (&$calls): void {
+            $connection->afterCommit(function () use (&$calls): void {
+                $calls[] = 'afterCommit';
+            });
+        });
+
+        // afterRollBack() exists on Laravel 12 only.
+        $expected = method_exists($this->connection, 'afterRollBack') ? ['afterRollBack', 'afterCommit'] : ['afterCommit'];
+        self::assertSame($expected, $calls);
+        self::assertSame(['BEGIN', 'ROLLBACK', 'BEGIN', 'COMMIT'], $this->lake->sqls());
     }
 
     public function testStatementsAfterANestedRollbackAreRejected(): void

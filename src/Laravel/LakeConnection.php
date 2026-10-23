@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace TiDBCloud\Lake\Laravel;
 
 use Illuminate\Database\Connection;
+use Throwable;
 use TiDBCloud\Lake\Exception\UnsupportedFeatureException;
 use TiDBCloud\Lake\Pdo\LakePdo;
 
@@ -96,6 +97,24 @@ class LakeConnection extends Connection
         }
 
         parent::performRollBack($toLevel);
+    }
+
+    /**
+     * A failed commit (normal for a rollback-only transaction) leaves the
+     * transaction rolled back, yet Laravel keeps its record in the
+     * transactions manager, so its afterCommit callbacks would run on the
+     * next successful commit. Drop the record once the server has no
+     * transaction left; on Laravel 12 this also runs afterRollBack callbacks.
+     */
+    protected function handleCommitTransactionException(Throwable $e, $currentAttempt, $maxAttempts)
+    {
+        try {
+            parent::handleCommitTransactionException($e, $currentAttempt, $maxAttempts);
+        } finally {
+            if (!$this->getPdo()->inTransaction()) {
+                $this->transactionsManager?->rollback($this->getName(), 0);
+            }
+        }
     }
 
     protected function getDefaultQueryGrammar()

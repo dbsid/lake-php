@@ -149,6 +149,14 @@ final class Connection
     }
 
     /**
+     * The server-reported transaction state, see {@see Client::transactionState()}.
+     */
+    public function transactionState(): string
+    {
+        return $this->client->transactionState();
+    }
+
+    /**
      * Executes a callback inside a transaction.
      *
      * @template T

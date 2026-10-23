@@ -122,13 +122,27 @@ final class Client
     }
 
     /**
+     * The session's transaction state as last reported by the server
+     * (session.txn_state): "AutoCommit", "Active" or "Fail" (aborted by a
+     * failed statement); '' until the server reports one.
+     *
+     * The server reports "Fail" only for errors raised while executing a
+     * statement; one rejected while parsing or planning (e.g. an unknown
+     * table) also aborts the transaction but leaves it "Active".
+     */
+    public function transactionState(): string
+    {
+        return (string) ($this->sessionValue('txn_state') ?? '');
+    }
+
+    /**
      * Whether the session has an open explicit transaction, as last
-     * reported by the server (session.txn_state). A transaction aborted by a
-     * failed statement ("Fail") stays open until COMMIT or ROLLBACK.
+     * reported by the server. An aborted ("Fail") transaction stays open
+     * until COMMIT or ROLLBACK.
      */
     public function inTransaction(): bool
     {
-        return in_array($this->sessionValue('txn_state'), ['Active', 'Fail'], true);
+        return in_array($this->transactionState(), ['Active', 'Fail'], true);
     }
 
     /**

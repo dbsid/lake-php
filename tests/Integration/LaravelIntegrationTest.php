@@ -230,22 +230,26 @@ final class LaravelIntegrationTest extends TestCase
 
     public function testCommitFailsAfterAFailedStatement(): void
     {
-        try {
-            // Lake aborts the transaction on the failed SELECT; without the
-            // driver's check, COMMIT would succeed and silently drop the row.
-            $this->db->transaction(function (): void {
-                AttributionLog::create(['id' => 1, 'user_id' => 1]);
-                try {
-                    $this->db->select('SELECT * FROM lake_php_it_no_such_table');
-                } catch (QueryException) {
-                }
-            });
-            self::fail('expected PDOException');
-        } catch (\PDOException $e) {
-            self::assertStringContainsString('A statement in this transaction failed', $e->getMessage());
-        }
+        // Both abort the transaction, but the server reports "Fail" only for
+        // the second: the first is rejected before execution.
+        foreach (['SELECT * FROM lake_php_it_no_such_table', 'SELECT 1 / 0'] as $failing) {
+            try {
+                // Without the driver's check, COMMIT would succeed and
+                // silently drop the row.
+                $this->db->transaction(function () use ($failing): void {
+                    AttributionLog::create(['id' => 1, 'user_id' => 1]);
+                    try {
+                        $this->db->select($failing);
+                    } catch (QueryException) {
+                    }
+                });
+                self::fail('expected PDOException after ' . $failing);
+            } catch (\PDOException $e) {
+                self::assertStringContainsString('A statement in this transaction failed', $e->getMessage());
+            }
 
-        self::assertSame(0, AttributionLog::count());
+            self::assertSame(0, AttributionLog::count());
+        }
     }
 
     public function testEagerLoadWithLimit(): void

@@ -271,6 +271,31 @@ final class LakePdoTest extends TestCase
         );
     }
 
+    public function testCommitFailsWhenTheServerReportsTheTransactionAborted(): void
+    {
+        $this->lake->ok();
+        $this->lake->error(1006, 'divided by zero', 'Fail');
+        $this->lake->ok();
+        $pdo = $this->lake->pdo();
+
+        $pdo->beginTransaction();
+        try {
+            // Bypasses LakePdo, so only the server's state tells.
+            $pdo->connection()->execute('select 1/0');
+            self::fail('expected QueryException');
+        } catch (QueryException) {
+        }
+        self::assertSame('Fail', $pdo->connection()->transactionState());
+        try {
+            $pdo->commit();
+            self::fail('expected PDOException');
+        } catch (\PDOException $e) {
+            self::assertStringContainsString('A statement in this transaction failed', $e->getMessage());
+        }
+
+        self::assertSame(['BEGIN', 'select 1/0', 'ROLLBACK'], $this->lake->sqls());
+    }
+
     public function testQuoteAndServerVersion(): void
     {
         $this->lake->result(['version' => 'String'], [['v1.2.3']]);

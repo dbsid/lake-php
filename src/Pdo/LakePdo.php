@@ -38,6 +38,8 @@ final class LakePdo extends \PDO
         \PDO::ATTR_ORACLE_NULLS => \PDO::NULL_NATURAL,
     ];
 
+    private const ABORTED = 'A statement in this transaction failed, which aborts the transaction on TiDB Cloud Lake.';
+
     /** Why the open transaction can no longer commit, see {@see setRollbackOnly()}. */
     private ?string $rollbackOnly = null;
 
@@ -109,9 +111,11 @@ final class LakePdo extends \PDO
             return self::wrap(fn (): QueryResponse => $this->connection->run($sql, $params));
         } catch (\PDOException $e) {
             // Lake aborts a transaction when one of its statements fails, and
-            // a later COMMIT then silently rolls everything back.
+            // a later COMMIT then silently rolls everything back. The server
+            // does not report "Fail" for errors raised before execution (an
+            // unknown table, a syntax error), so this cannot rely on it.
             if ($e->getPrevious() instanceof QueryException) {
-                $this->setRollbackOnly('A statement in this transaction failed, which aborts the transaction on TiDB Cloud Lake.');
+                $this->setRollbackOnly(self::ABORTED);
             }
 
             throw $e;
@@ -130,16 +134,17 @@ final class LakePdo extends \PDO
     }
 
     /**
-     * Commits, unless the transaction was marked rollback-only: then it is
-     * rolled back and a \PDOException explains why.
+     * Commits, unless the transaction was marked rollback-only or the server
+     * reports it aborted: then it is rolled back and a \PDOException
+     * explains why.
      */
     public function commit(): bool
     {
         if (!$this->inTransaction()) {
             throw self::error('HY000', 'There is no active transaction');
         }
-        if ($this->rollbackOnly !== null) {
-            $reason = $this->rollbackOnly;
+        $reason = $this->rollbackOnly ?? ($this->connection->transactionState() === 'Fail' ? self::ABORTED : null);
+        if ($reason !== null) {
             $this->rollBack();
 
             throw self::error('25000', $reason . ' The transaction has been rolled back.');

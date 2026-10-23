@@ -380,6 +380,64 @@ final class LakeConnectionTest extends TestCase
         self::assertSame(['BEGIN', 'ROLLBACK', 'BEGIN', 'COMMIT'], $this->lake->sqls());
     }
 
+    public function testFailedManualCommitLeavesTheConnectionUsable(): void
+    {
+        $this->connection->setTransactionManager(new DatabaseTransactionsManager());
+        $this->lake->ok();
+        $this->lake->ok();
+        $this->lake->ok();
+        $this->lake->dml(['number of rows inserted' => 1]);
+        $this->lake->ok();
+        $this->lake->ok();
+        $this->lake->ok();
+
+        $fired = [];
+        $this->connection->beginTransaction();
+        $this->connection->afterCommit(function () use (&$fired): void {
+            $fired[] = 'afterCommit of the rolled-back transaction';
+        });
+        $this->connection->beginTransaction();
+        $this->connection->rollBack();
+        try {
+            $this->connection->commit();
+            self::fail('expected PDOException');
+        } catch (\PDOException) {
+            // Only logged, no rollBack(), e.g. in a long-running worker.
+        }
+        self::assertSame(0, $this->connection->transactionLevel());
+
+        // The next unit of work is a real transaction again.
+        $this->connection->beginTransaction();
+        $this->connection->insert('insert into t values (1)');
+        $this->connection->rollBack();
+        $this->connection->transaction(fn () => null);
+
+        self::assertSame([], $fired);
+        self::assertSame(
+            ['BEGIN', 'ROLLBACK', 'BEGIN', 'insert into t values (1)', 'ROLLBACK', 'BEGIN', 'COMMIT'],
+            $this->lake->sqls(),
+        );
+    }
+
+    public function testRollingBackAfterAFailedManualCommitStillWorks(): void
+    {
+        $this->lake->ok();
+        $this->lake->ok();
+
+        $this->connection->beginTransaction();
+        $this->connection->beginTransaction();
+        $this->connection->rollBack();
+        try {
+            $this->connection->commit();
+            self::fail('expected PDOException');
+        } catch (\PDOException) {
+            $this->connection->rollBack();
+        }
+
+        self::assertSame(0, $this->connection->transactionLevel());
+        self::assertSame(['BEGIN', 'ROLLBACK'], $this->lake->sqls());
+    }
+
     public function testStatementsAfterANestedRollbackAreRejected(): void
     {
         $this->lake->ok();

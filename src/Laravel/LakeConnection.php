@@ -117,6 +117,27 @@ class LakeConnection extends Connection
         }
     }
 
+    /**
+     * The same for DB::beginTransaction() / DB::commit(): Laravel lowers the
+     * level only after a successful commit. If it failed and left no
+     * transaction on the server, the level would stay at 1 unless the caller
+     * rolls back, and the next beginTransaction() would only raise it instead
+     * of sending BEGIN, so that work would run (and stay) in autocommit.
+     */
+    public function commit()
+    {
+        try {
+            parent::commit();
+        } catch (Throwable $e) {
+            if ($this->transactions === 1 && !$this->getPdo()->inTransaction()) {
+                $this->transactions = 0;
+                $this->transactionsManager?->rollback($this->getName(), 0);
+            }
+
+            throw $e;
+        }
+    }
+
     protected function getDefaultQueryGrammar()
     {
         // Laravel 12 grammars take the connection in their constructor;

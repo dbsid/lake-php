@@ -6,6 +6,7 @@ namespace TiDBCloud\Lake;
 
 use GuzzleHttp\Client as GuzzleClient;
 use GuzzleHttp\Psr7\HttpFactory;
+use Psr\Http\Client\ClientExceptionInterface;
 use Psr\Http\Client\ClientInterface as PsrClientInterface;
 use Psr\Http\Client\NetworkExceptionInterface;
 use Psr\Http\Message\RequestFactoryInterface;
@@ -185,8 +186,8 @@ final class Client
         }
         try {
             $this->doRequest('POST', '/v1/session/logout', [], $this->needSticky());
-        } catch (LakeException) {
-            // best effort
+        } catch (LakeException | ClientExceptionInterface) {
+            // best effort, network errors included
         }
         $this->loggedIn = false;
     }
@@ -362,8 +363,8 @@ final class Client
         }
         try {
             $this->doRequest('GET', $response->finalUri, null, true);
-        } catch (LakeException) {
-            // best effort
+        } catch (LakeException | ClientExceptionInterface) {
+            // best effort, network errors included
         }
     }
 
@@ -377,8 +378,8 @@ final class Client
         }
         try {
             $this->doRequest('GET', $response->killUri, null, true);
-        } catch (LakeException) {
-            // best effort
+        } catch (LakeException | ClientExceptionInterface) {
+            // best effort, network errors included
         }
     }
 

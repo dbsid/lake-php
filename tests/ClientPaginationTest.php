@@ -4,12 +4,15 @@ declare(strict_types=1);
 
 namespace TiDBCloud\Lake\Tests;
 
+use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Psr7\Response;
 use PHPUnit\Framework\TestCase;
+use Psr\Http\Message\RequestInterface;
 use TiDBCloud\Lake\Client;
 use TiDBCloud\Lake\Config;
 use TiDBCloud\Lake\Exception\LakeException;
 use TiDBCloud\Lake\Exception\QueryException;
+use TiDBCloud\Lake\QueryResponse;
 use TiDBCloud\Lake\Tests\Support\MockHttpClient;
 
 final class ClientPaginationTest extends TestCase
@@ -335,6 +338,41 @@ final class ClientPaginationTest extends TestCase
         self::assertSame('/v1/verify', $http->requests[0]->getUri()->getPath());
         self::assertStringContainsString('"sql":"BEGIN"', $http->bodies[2]);
         self::assertStringContainsString('"sql":"COMMIT"', $http->bodies[4]);
+    }
+
+    public function testBestEffortRequestsIgnoreNetworkErrors(): void
+    {
+        // Seen against a real gateway: the GET of final_uri failed with a TLS
+        // EOF, and that failed a query whose result was already read.
+        $networkError = static fn (RequestInterface $request) => throw new ConnectException(
+            'cURL error 56: OpenSSL SSL_read: unexpected eof while reading',
+            $request,
+        );
+        $http = new MockHttpClient([
+            $this->jsonResponse([
+                'id' => 'q-1',
+                'schema' => [['name' => 'x', 'type' => 'Int32']],
+                'data' => [['1']],
+                'state' => 'Succeeded',
+                'final_uri' => '/v1/query/q-1/final',
+                'session' => ['need_keep_alive' => true],
+            ]),
+            $networkError,
+            $networkError,
+            $networkError,
+        ]);
+
+        $client = new Client(Config::fromDsn('lake://u:p@localhost/db?sslmode=disable&login=disable'), $http);
+        $conn = $client->connect();
+
+        self::assertSame([['x' => 1]], $conn->queryAll('SELECT 1 AS x'));
+        $client->killQuery(QueryResponse::fromArray(['kill_uri' => '/v1/query/q-1/kill']));
+        $conn->close();
+
+        self::assertSame(
+            ['/v1/query', '/v1/query/q-1/final', '/v1/query/q-1/kill', '/v1/session/logout'],
+            array_map(static fn (RequestInterface $request): string => $request->getUri()->getPath(), $http->requests),
+        );
     }
 
     public function testTimezoneIsSentAsSessionSetting(): void
